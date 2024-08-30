@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+# Load data from Excel files
+data = pd.read_excel('C:/Users/320232638/Downloads/phvt_cz2.xlsx')
+by_data = pd.read_excel('C:/Users/320232638/Downloads/by.xlsx')
+prod_info = pd.read_excel('C:/Users/320232638/Downloads/info.xlsx', header=None)
+manual_info = pd.read_excel('C:/Users/320232638/Downloads/manual.xlsx')
+
+# Preprocess 'Sell-Out, Qty' column and add datetime
+data['Sell-Out, Qty'] = data['Sell-Out, Qty'].astype(int)
+data['ds'] = pd.to_datetime(data[['Year', 'Month']].assign(DAY=1))
+data = data.drop(columns=['Year', 'Month']).rename(columns={'Sell-Out, Qty': 'y'})
+
+# Filter SKUs based on by_data
+skus_to_forecast = by_data['DmdUnit'].unique()
+data = data[data['SKU'].isin(skus_to_forecast)]
+
+# Extract last date and determine forecast start and valid start dates
+last_date = pd.to_datetime(by_data.columns[-1][:4] + '-' + by_data.columns[-1][5:] + '-01')
+forecast_start_date = last_date + pd.DateOffset(months=1)
+valid_start_date = forecast_start_date - pd.DateOffset(years=1)
+
+# Preprocess product information df
+prod_info.columns = ["SKU", "Launch", "Active", "Phaseout", "EOL"]
+date_columns = ["Launch", "Active", "Phaseout", "EOL"]
+replacement_date = pd.to_datetime("1.1.2100", format="%d.%m.%Y")
+
+for column in date_columns:
+    prod_info[column] = pd.to_datetime(prod_info[column] - 2, origin='1900-01-01', unit='D', errors='coerce')
+    prod_info[column].fillna(replacement_date, inplace=True)
+    prod_info[column] = prod_info[column].apply(lambda x: replacement_date if x == pd.Timestamp("1899-12-30") else x)
+
+# Define hierarchy levels
+hierarchy_levels = ['BG', 'Category', 'MAG', 'AG', 'SKU']
+
+# Function to calculate moving average trend
+def calculate_moving_average_trend(group, window=2):
+    return group.set_index('ds')['y'].rolling(window=window, min_periods=1, center=True).mean().dropna()
+
+# Function to decompose time series seasonality
+def decompose_time_series_seasonality(group, freq=12):
+    if len(group) >= 2 * freq:
+        decomposition = seasonal_decompose(group.set_index('ds')['y'], model='multiplicative', period=freq)
+        return decomposition.seasonal.dropna()
+    return None
+
+# Calculate trend and seasonality for each hierarchy level
+data['trend'], data['seasonal'] = np.nan, np.nan
+
+for level in hierarchy_levels:
+    grouped_data = data.groupby([level, 'ds'])['y'].sum().reset_index()
+
+    for name, group in grouped_data.groupby(level):
+        trend = calculate_moving_average_trend(group)
+        if trend is not None:
+            # Direct assignment based on matching level and date without reindexing
+            data.loc[data[level] == name, 'trend'] = data.loc[data[level] == name, 'ds'].map(trend)
+
+        if len(group) >= 24:
+            seasonal = decompose_time_series_seasonality(group)
+            if seasonal is not None:
+                # Direct assignment based on matching level and date without reindexing
+                data.loc[data[level] == name, 'seasonal'] = data.loc[data[level] == name, 'ds'].map(seasonal)
+
+# Backfill missing trend and seasonality
+data['trend'] = data.groupby(hierarchy_levels[-1])['trend'].transform(lambda x: x.bfill().ffill())
+data['seasonal'] = data.groupby(hierarchy_levels[-1])['seasonal'].transform(lambda x: x.bfill().ffill())
+
+# Forecast generation
+forecast_horizon = 12
+forecasts = []
+forecast_dates = pd.date_range(start=forecast_start_date, periods=forecast_horizon, freq='MS')
+
+# Group by SKU and calculate forecast
+for sku, group in data.groupby('SKU'):
+    last_trend = group['trend'].iloc[-1]
+    last_seasonality = group['seasonal'].iloc[-forecast_horizon:]
+
+    # Get the phaseout date for the current SKU (check if it exists)
+    po_date = prod_info.loc[prod_info['SKU'] == sku, 'Phaseout']
+    
+    if po_date.empty:
+        # If no phaseout date is found, store the sku for printing and assume it is phaseout
+        print(f"{sku} not found in LineChart -> assume it has Phased-out already")
+        po_date = pd.Timestamp("2000-01-01")
+    else:
+        po_date = po_date.values[0]
+
+    # Generate forecast ensuring non-negative integer values
+    forecasted_values = []
+    for i in range(forecast_horizon):
+        forecast_date = forecast_dates[i]
+        if forecast_date < po_date:  # Only forecast if before or on the phaseout date
+            forecast_value = max(0, round(last_trend * last_seasonality.values[i % len(last_seasonality)]))
+        else:
+            forecast_value = 0  # Set forecast to 0 if beyond the phaseout date
+        forecasted_values.append(forecast_value)
+    
+    forecast_df = pd.DataFrame({'ds': forecast_dates, 'SKU': sku, 'forecast': forecasted_values})
+    forecasts.append(forecast_df)
+
+# Combine forecast data
+forecast_data = pd.concat(forecasts).rename(columns={'SKU': 'DmdUnit', 'ds': 'Date'})
+
+# Pivot and format the forecast
+forecast_pivot_df = forecast_data.pivot(index='DmdUnit', columns='Date', values='forecast').reset_index()
+forecast_pivot_df.columns = ['DmdUnit'] + [f"{date.year}M{date.month:02d}" for date in forecast_pivot_df.columns[1:]]
+
+# Merge with by_data
+final_forecast_df = by_data[['DmdUnit']].merge(forecast_pivot_df, on='DmdUnit', how='left')
+
+# Update using manual inputs
+final_forecast_df.set_index('DmdUnit', inplace=True)
+manual_info.set_index('DmdUnit', inplace=True)
+final_forecast_df.update(manual_info)
+final_forecast_df.reset_index(inplace=True)
+
+# Save results
+final_forecast_df.to_excel('C:/Users/320232638/Downloads/cz2_result_new3.xlsx', index=False)
